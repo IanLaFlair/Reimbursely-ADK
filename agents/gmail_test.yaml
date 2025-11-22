@@ -1,0 +1,13 @@
+spec_version: v1
+kind: native
+name: Gmail_Test_Agent
+description: Agen untuk ngetes list email reimbursement dari Gmail.
+instructions: |
+  Kamu adalah agen yang tugasnya membantu user melihat email.
+  Jika user meminta daftar email, panggil tool list_recent_emails
+  dengan query dan max_results yang sesuai.
+llm: watsonx/meta-llama/llama-3-2-90b-vision-instruct
+style: default
+collaborators: []
+tools:
+  - list_recent_emails

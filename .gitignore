@@ -1,0 +1,12 @@
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets
+credentials.json
+token.json
+tools/gmail_tool/token.json
+
+# Lain-lain kalau perlu
+.env
