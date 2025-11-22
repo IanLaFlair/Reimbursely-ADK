@@ -13,3 +13,4 @@ tools:
   - list_reimburse_emails_this_week
   - parse_reimburse_form_from_email
   - get_email_detail
+  - extract_all_payment_amounts_from_email
