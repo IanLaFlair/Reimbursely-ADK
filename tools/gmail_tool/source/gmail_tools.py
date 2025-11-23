@@ -900,7 +900,7 @@ def list_reimburse_emails_for_period(start_date: str, end_date: str, max_results
         Dict containing period info and list of emails (id, subject, from, date).
     """
     service = _get_gmail_service()
-    finance_addr = "finance.request@pituku.id"
+    finance_addr = "fak3optic@gmail.com"
 
     query = (
         f'("reimburse" OR "reimbursement") '
