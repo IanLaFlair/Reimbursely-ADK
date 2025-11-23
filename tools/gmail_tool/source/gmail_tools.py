@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 
 from googleapiclient.discovery import build
@@ -20,7 +20,6 @@ import base64
 # import pandas as pd
 
 
-
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # BASE_DIR = folder "gmail_tool"
@@ -28,23 +27,29 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 TOKEN_PATH = BASE_DIR / "token.json"
 VISION_KEY_PATH = Path(__file__).resolve().parent.parent / "vision_api_key.txt"
 
+
 def _get_vision_api_key() -> str | None:
     try:
         return VISION_KEY_PATH.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return None
 
+
 def _get_gmail_service():
-    """Load token.json dari paket tool dan buat service Gmail."""
+    """Load token.json from the tool package and build a Gmail service."""
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
     service = build("gmail", "v1", credentials=creds)
     return service
 
+
 def _get_current_week_range_until_today():
     """
-    Ambil range Senin hingga hari ini.
-    - monday: Senin minggu ini
-    - today_exclusive: besok (dipakai sebagai before: YYYY/MM/DD)
+    Get the date range from Monday of this week until today.
+
+    Returns:
+        (monday_str, tomorrow_str) in format YYYY/MM/DD where:
+        - monday_str  = Monday of the current week (inclusive, used in `after:`)
+        - tomorrow_str = tomorrow (exclusive, used in `before:`)
     """
     today = date.today()
     weekday = today.weekday()  # Monday=0
@@ -57,19 +62,20 @@ def _get_current_week_range_until_today():
 
     return fmt(monday), fmt(tomorrow)
 
+
 VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
 
 
 def _call_vision_ocr(image_bytes: bytes) -> str:
     """
-    Panggil Google Cloud Vision OCR dan mengembalikan full text hasil OCR.
-    API key dibaca dari tools/gmail_tool/vision_api_key.txt
+    Call Google Cloud Vision OCR and return the full text result.
+
+    API key is read from tools/gmail_tool/vision_api_key.txt.
     """
     api_key = _get_vision_api_key()
     if not api_key:
         raise RuntimeError(
-            "vision_api_key.txt tidak ditemukan atau kosong. "
-            "Isi file tersebut dengan API key Cloud Vision."
+            "vision_api_key.txt not found or empty. Please put your Cloud Vision API key in that file."
         )
 
     img_b64 = b64encode(image_bytes).decode("utf-8")
@@ -99,12 +105,15 @@ def _call_vision_ocr(image_bytes: bytes) -> str:
 
 def _parse_amounts_from_text(text: str) -> List[int]:
     """
-    Ambil kandidat angka rupiah dari teks OCR.
-    Contoh:
+    Extract candidate Rupiah amounts from OCR text.
+
+    Examples it should catch:
       - IDR 300,000
       - Rp 300.000
       - 1.250.000
-    Return: list angka (int), mungkin kosong.
+
+    Returns:
+        List of integer amounts (may be empty).
     """
     if not text:
         return []
@@ -118,7 +127,7 @@ def _parse_amounts_from_text(text: str) -> List[int]:
         s = num_str.strip().replace(",", ".")
         if "." in s:
             parts = s.split(".")
-            # kalau 2 digit terakhir kemungkinan desimal (mis. 300.000,00)
+            # if the last part has 2 digits it is likely decimals (e.g. 300.000,00)
             if len(parts[-1]) == 2:
                 s = "".join(parts[:-1])
             else:
@@ -143,13 +152,12 @@ def _parse_amounts_from_text(text: str) -> List[int]:
             except ValueError:
                 continue
 
-    # unik + sort
+    # unique + sorted
     return sorted(set(amounts))
 
 
-
 def _extract_text_body(payload) -> str:
-    """Ambil isi email (text/plain) dari struktur multipart Gmail."""
+    """Extract the email body (text/plain) from Gmail multipart payload."""
     if not payload:
         return ""
     mime = payload.get("mimeType", "")
@@ -165,8 +173,9 @@ def _extract_text_body(payload) -> str:
             return txt
     return ""
 
+
 def _download_attachment_bytes(service, message_id: str, attachment_id: str) -> bytes:
-    """Download attachment Gmail sebagai bytes."""
+    """Download a Gmail attachment as raw bytes."""
     att = (
         service.users()
         .messages()
@@ -177,10 +186,12 @@ def _download_attachment_bytes(service, message_id: str, attachment_id: str) -> 
     data = att.get("data", "")
     return urlsafe_b64decode(data.encode("utf-8"))
 
+
 def _get_receipt_image_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Ambil SEMUA attachment yang terlihat seperti bukti bayar (image).
-    Versi 1: mimeType image/* atau nama file .jpg/.jpeg/.png
+    Filter all attachments that look like payment receipts (images).
+
+    Version 1: mimeType image/* or filename ends with .jpg/.jpeg/.png
     """
     receipt_atts: List[Dict[str, Any]] = []
     for att in attachments:
@@ -190,9 +201,10 @@ def _get_receipt_image_attachments(attachments: List[Dict[str, Any]]) -> List[Di
             receipt_atts.append(att)
     return receipt_atts
 
+
 def _reconcile_form_and_receipts(form_data: Dict[str, Any], receipts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Cocokkan items di form dengan bukti bayar (receipts).
+    Match items in the reimbursement form with payment receipts.
 
     form_data:
       {
@@ -217,7 +229,7 @@ def _reconcile_form_and_receipts(form_data: Dict[str, Any], receipts: List[Dict[
       ]
     """
     items: List[Dict[str, Any]] = form_data.get("items", [])
-    # hanya receipts yang punya selected_amount valid
+    # use only receipts with a valid selected_amount
     usable_receipts = [
         {"idx": i, "amount": r.get("selected_amount"), "filename": r.get("filename")}
         for i, r in enumerate(receipts)
@@ -261,7 +273,7 @@ def _reconcile_form_and_receipts(form_data: Dict[str, Any], receipts: List[Dict[
                 }
             )
 
-    # semua receipts yang tidak terpakai
+    # all receipts that were not used
     unmatched_receipts = [
         receipts[idx]
         for idx, used in used_flags.items()
@@ -280,15 +292,15 @@ def _reconcile_form_and_receipts(form_data: Dict[str, Any], receipts: List[Dict[
         if form_total != sum_receipts:
             overall_status = "MISMATCH"
             notes.append(
-                f"Total form ({form_total}) tidak sama dengan total bukti bayar ({sum_receipts})."
+                f"Form total ({form_total}) does not match sum of receipt amounts ({sum_receipts})."
             )
 
     if any(i["status"] != "MATCH" for i in per_item_results):
         overall_status = "MISMATCH"
-        notes.append("Ada item yang tidak punya bukti bayar yang cocok.")
+        notes.append("Some items do not have a matching payment receipt.")
 
     if unmatched_receipts:
-        notes.append("Ada bukti bayar yang tidak terpakai / tidak cocok dengan item mana pun.")
+        notes.append("Some payment receipts are unused / do not match any item.")
 
     return {
         "overall_status": overall_status,
@@ -299,10 +311,11 @@ def _reconcile_form_and_receipts(form_data: Dict[str, Any], receipts: List[Dict[
         "notes": notes,
     }
 
+    # --- unreachable legacy code below (kept as-is, never executed) ---
     items = form["items"]
     receipts_list = receipts["receipts"]
 
-    # tandai receipt yang sudah dipakai
+    # mark receipts that are already used
     used = [False] * len(receipts_list)
     hasil_items = []
 
@@ -337,7 +350,7 @@ def _reconcile_form_and_receipts(form_data: Dict[str, Any], receipts: List[Dict[
                 }
             )
 
-    # receipts yang belum terpakai = kelebihan / unmatched
+    # receipts that remain unused
     unmatched_receipts = [
         rc for i, rc in enumerate(receipts_list) if not used[i]
     ]
@@ -347,10 +360,52 @@ def _reconcile_form_and_receipts(form_data: Dict[str, Any], receipts: List[Dict[
         "unmatched_receipts": unmatched_receipts,
     }
 
+def _select_form_pdf_attachment(attachments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Choose the most likely PDF that represents the reimbursement *form*,
+    not the payment receipt.
+
+    Heuristics:
+    - Only consider .pdf attachments.
+    - Prefer filenames containing words like 'reimburse', 'form', 'persetujuan', 'approval'.
+    - Penalize filenames that look like receipts/invoices (receipt, bukti, invoice, struk).
+    """
+    pdf_atts: List[Dict[str, Any]] = []
+    for att in attachments:
+        mime = (att.get("mimeType") or "").lower()
+        filename = (att.get("filename") or "").lower()
+        if "pdf" in mime or filename.endswith(".pdf"):
+            pdf_atts.append(att)
+
+    if not pdf_atts:
+        return None
+
+    def score(att: Dict[str, Any]) -> int:
+        name = (att.get("filename") or "").lower()
+        s = 0
+
+        # Positive signals → likely the PITUKU form
+        if any(k in name for k in ["reimburse", "reimbursement", "form", "persetujuan", "approval"]):
+            s += 10
+
+        # Negative signals → likely a receipt/invoice instead of the form
+        if any(k in name for k in ["receipt", "bukti", "invoice", "struk"]):
+            s -= 5
+
+        return s
+
+    pdf_atts.sort(key=score, reverse=True)
+    return pdf_atts[0]
+
 def _parse_reimburse_form_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
     """
-    Parse form reimburse Pituku (seperti contoh PDF) menjadi data terstruktur.
-    Asumsi layout mirip dengan contoh: Tanggal Pengajuan, DETAIL PENGAJUAN, Nama Bank, dst.
+    Parse the Pituku reimbursement form PDF (like the provided example)
+    into structured data.
+
+    Assumes a layout similar to the sample:
+      - Tanggal Pengajuan
+      - DETAIL PENGAJUAN
+      - Nama Bank, Nomor Rekening, Nama Rekening
     """
     reader = PdfReader(BytesIO(pdf_bytes))
     text_parts = []
@@ -359,14 +414,14 @@ def _parse_reimburse_form_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
         text_parts.append(t)
     full_text = "\n".join(text_parts)
 
-    # Normalisasi jadi list baris
+    # Normalize into a list of non-empty lines
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
 
     # Tanggal Pengajuan
     tanggal = ""
     for ln in lines:
         if ln.startswith("Tanggal Pengajuan"):
-            # contoh: "Tanggal Pengajuan : 16/04/2025"
+            # e.g. "Tanggal Pengajuan : 16/04/2025"
             parts = ln.split(":", 1)
             if len(parts) == 2:
                 tanggal = parts[1].strip()
@@ -382,29 +437,30 @@ def _parse_reimburse_form_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
         elif ln.startswith("Nama Rekening"):
             nama_rek = ln.split(":", 1)[1].strip()
 
-    # Baris detail pengajuan
-    # Kita cari baris yang mengandung "Fee Driver" dll, kemudian ambil angka-angkanya
+    # Detail pengajuan row
+    # We search for the row containing "No Description Detail Harga Jumlah Sub Total"
     item_description = ""
     harga = jumlah = subtotal = None
 
-    # gabungkan 3 baris setelah "No Description Detail Harga Jumlah Sub Total"
+    # join 3 lines after "No Description Detail Harga Jumlah Sub Total"
     for i, ln in enumerate(lines):
         if ln.startswith("No Description"):
-            row_text = " ".join(lines[i + 1 : i + 4])  # relatif aman utk contoh
-            # Deskripsi: buang "1 " di depan dan apapun setelah "Rp"
+            row_text = " ".join(lines[i + 1: i + 4])  # relatively safe for the sample
+            # Description: drop leading "1 " and anything after "Rp"
             m_desc = re.search(r"1\s+(.*?)\s+Rp", row_text)
             if m_desc:
                 item_description = m_desc.group(1).strip()
 
-            # Angka: ambil semua pola 300.000, 1.250.000, dst
+            # Numbers: capture patterns like 300.000, 1.250.000, etc.
             nums = re.findall(r"(\d{1,3}(?:\.\d{3})+)", row_text)
+
             def to_int(s: str) -> int:
                 return int(s.replace(".", ""))
 
             if nums:
                 harga = to_int(nums[0])
                 subtotal = to_int(nums[-1])
-            # Cari jumlah (biasanya 1, 2, dst) di antara harga & subtotal
+            # Find quantity (usually 1,2,...) between price & subtotal
             m_jumlah = re.search(r"\s(\d+)\s+Rp", row_text)
             if m_jumlah:
                 jumlah = int(m_jumlah.group(1))
@@ -431,7 +487,7 @@ def _parse_reimburse_form_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
 
 
 def _collect_attachments(payload, out_list):
-    """Kumpulkan attachment (id, filename, mimeType) dari payload Gmail."""
+    """Collect attachments (id, filename, mimeType) from Gmail payload."""
     if not payload:
         return
 
@@ -451,25 +507,25 @@ def _collect_attachments(payload, out_list):
     for part in payload.get("parts", []):
         _collect_attachments(part, out_list)
 
+
 @tool()
 def export_reimburse_summary_this_week() -> Dict[str, Any]:
-    
     """
-    Generate laporan reimbursement minggu ini dalam bentuk file Excel (sheet Summary saja).
+    Generate this week's reimbursement report as an Excel file (Summary sheet only).
 
-    - Ambil semua email reimburse minggu ini dari Gmail.
-    - Analisa tiap email dengan analyze_reimburse_email.
-    - Susun 1 sheet Summary berisi:
-        Email ID, Subject, Tanggal Pengajuan, Total Form, Total Bukti Bayar, Status, Catatan.
-    - Kembalikan file Excel sebagai base64 string.
+    - Fetch all reimbursement emails for this week from Gmail.
+    - Analyze each email using analyze_reimburse_email.
+    - Build one Summary sheet containing:
+        Email ID, Subject, Submission Date, Form Total, Receipt Total, Status, Notes.
+    - Return the Excel file as a base64 string.
     """
     import pandas as pd
     service = _get_gmail_service()
 
-    # 1) Range minggu ini (helper yang sudah ada di kode kamu)
+    # 1) This week's range (using existing helper)
     start_date, end_date_exclusive = _get_current_week_range_until_today()
 
-    # Query sama seperti list_reimburse_emails_this_week (silakan samakan kalau beda)
+    # Same query style as list_reimburse_emails_this_week
     query = f"after:{start_date} before:{end_date_exclusive} reimburse"
 
     try:
@@ -481,7 +537,7 @@ def export_reimburse_summary_this_week() -> Dict[str, Any]:
         )
     except HttpError as e:
         return {
-            "error": "HttpError saat mencari email reimburse minggu ini",
+            "error": "HttpError while searching reimbursement emails for this week.",
             "status": e.resp.status,
             "reason": e._get_reason(),
             "start_date": start_date,
@@ -508,7 +564,7 @@ def export_reimburse_summary_this_week() -> Dict[str, Any]:
                     "Total Form": None,
                     "Total Bukti Bayar": None,
                     "Status": "ERROR",
-                    "Catatan": f"Gagal analisa: {e}",
+                    "Catatan": f"Analysis failed: {e}",
                 }
             )
             continue
@@ -536,7 +592,7 @@ def export_reimburse_summary_this_week() -> Dict[str, Any]:
             }
         )
 
-    # 2) Kalau tidak ada email, tetap return info
+    # 2) If there are no emails, still return info
     if not summary_rows:
         return {
             "filename": "reimbursely_summary_minggu_ini.xlsx",
@@ -545,29 +601,28 @@ def export_reimburse_summary_this_week() -> Dict[str, Any]:
             "row_count": 0,
             "start_date": start_date,
             "end_date_exclusive": end_date_exclusive,
-            "info": "Tidak ada email reimbursement minggu ini.",
+            "info": "No reimbursement emails found for this week.",
         }
 
-    # 3) Buat DataFrame dan Excel di memory
+    # 3) Build DataFrame and Excel in memory
     df = pd.DataFrame(summary_rows)
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         df.to_excel(writer, sheet_name="Summary", index=False)
 
-        # Rapihin dikit: header bold, auto filter, auto width
+        # Basic formatting: bold header, autofilter, simple auto width
         workbook = writer.book
         worksheet = writer.sheets["Summary"]
 
         header_format = workbook.add_format({"bold": True})
         worksheet.set_row(0, None, header_format)
 
-        # Autofilter seluruh range
+        # Autofilter entire range
         worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
 
         # Auto column width
         for col_idx, col_name in enumerate(df.columns):
-            # panjang maksimum antara nama kolom dan isi kolom
             max_len = max(
                 df[col_name].astype(str).map(len).max(),
                 len(col_name),
@@ -586,11 +641,14 @@ def export_reimburse_summary_this_week() -> Dict[str, Any]:
         "end_date_exclusive": end_date_exclusive,
     }
 
+
 @tool()
 def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
     """
-    OCR SEMUA bukti bayar (gambar) di email ini dan ekstrak jumlah bayar dari masing-masing.
-    Cocok untuk kasus 1 form > 1 item > 1 bukti bayar.
+    OCR ALL payment receipt images in this email and extract payment amounts
+    from each attachment.
+
+    Useful when one form has multiple items and each item has a receipt.
     """
     service = _get_gmail_service()
 
@@ -603,7 +661,7 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
         )
     except HttpError as e:
         return {
-            "error": "HttpError saat mengambil message untuk bukti bayar",
+            "error": "HttpError while fetching message for payment receipts.",
             "status": e.resp.status,
             "reason": e._get_reason(),
             "message_id": message_id,
@@ -615,7 +673,7 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
     receipt_atts = _get_receipt_image_attachments(attachments)
     if not receipt_atts:
         return {
-            "error": "Tidak ditemukan attachment gambar (bukti bayar) pada email ini.",
+            "error": "No image attachments (payment receipts) found in this email.",
             "message_id": message_id,
             "attachments_ditemukan": attachments,
         }
@@ -631,7 +689,7 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
             receipts_result.append(
                 {
                     "filename": att.get("filename"),
-                    "error": "Gagal download attachment",
+                    "error": "Failed to download attachment.",
                     "status": e.resp.status,
                     "reason": e._get_reason(),
                 }
@@ -646,7 +704,7 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
             receipts_result.append(
                 {
                     "filename": att.get("filename"),
-                    "error": f"Gagal OCR: {e}",
+                    "error": f"OCR failed: {e}",
                 }
             )
             continue
@@ -665,37 +723,41 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
         "receipts": receipts_result,
     }
 
+
 @tool()
 def list_reimburse_emails_this_week(max_results: int = 50) -> Dict[str, Any]:
     """
-    Mengambil email reimbursement untuk periode Senin–hari ini.
-    Dipakai untuk testing atau proses mingguan.
+    Fetch reimbursement emails for the period Monday–today.
+
+    Intended for testing or weekly processing.
     """
     start_date, tomorrow = _get_current_week_range_until_today()
     return list_reimburse_emails_for_period(start_date, tomorrow, max_results)
 
+
 @tool()
 def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
     """
-    Analisa lengkap 1 email reimbursement:
-    - Parse form reimburse (PDF) dari attachment.
-    - OCR semua bukti bayar (gambar) di email.
-    - Cocokkan item di form dengan bukti bayar.
-    - Kembalikan status OK / MISMATCH dan detailnya.
+    Fully analyze one reimbursement email:
+
+    - Parse reimbursement form (PDF) from attachments.
+    - OCR all payment receipts (image attachments).
+    - Reconcile form items against receipts.
+    - Return status OK / MISMATCH and detailed breakdown.
 
     Args:
-        message_id: ID email di Gmail.
+        message_id: Gmail message ID.
 
     Returns:
-        Dict berisi:
+        Dict containing:
           - form_data
           - receipts
-          - reconciliation (overall_status, per item, unmatched, total)
-        atau error jika ada yang gagal.
+          - reconciliation (overall_status, per item, unmatched, totals)
+        or an error dict if something fails.
     """
     service = _get_gmail_service()
 
-    # 1) Ambil email
+    # 1) Fetch the email
     try:
         msg = (
             service.users()
@@ -704,7 +766,7 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
             .execute()
         )
 
-        # Ambil subject dari header
+        # Extract subject from headers
         payload = msg.get("payload", {})
         headers = payload.get("headers", [])
 
@@ -717,7 +779,7 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
 
     except HttpError as e:
         return {
-            "error": "HttpError saat mengambil message",
+            "error": "HttpError while fetching message.",
             "status": e.resp.status,
             "reason": e._get_reason(),
             "message_id": message_id,
@@ -728,22 +790,16 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
 
     if not attachments:
         return {
-            "error": "Tidak ada attachment pada email ini.",
+            "error": "No attachments found in this email.",
             "message_id": message_id,
         }
 
-    # 2) Cari PDF form reimburse (ambil PDF pertama saja untuk versi 1)
-    form_att = None
-    for att in attachments:
-        mime = (att.get("mimeType") or "").lower()
-        filename = (att.get("filename") or "").lower()
-        if mime == "application/pdf" or filename.endswith(".pdf"):
-            form_att = att
-            break
+    # 2) Find reimbursement PDF form (first PDF attachment)
+    form_att = _select_form_pdf_attachment(attachments)
 
     if not form_att:
         return {
-            "error": "Tidak ditemukan attachment PDF form reimburse pada email ini.",
+            "error": "No reimbursement form PDF attachment found in this email.",
             "message_id": message_id,
             "attachments_ditemukan": attachments,
         }
@@ -755,7 +811,7 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
         )
     except HttpError as e:
         return {
-            "error": "HttpError saat download PDF form",
+            "error": "HttpError while downloading PDF form.",
             "status": e.resp.status,
             "reason": e._get_reason(),
             "message_id": message_id,
@@ -767,7 +823,7 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
         form_data = _parse_reimburse_form_pdf(pdf_bytes)
     except Exception as e:
         return {
-            "error": f"Gagal parse PDF form: {e}",
+            "error": f"Failed to parse reimbursement PDF form: {e}",
             "message_id": message_id,
             "filename": form_att.get("filename"),
         }
@@ -775,7 +831,7 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
     form_data["source_email_id"] = message_id
     form_data["source_pdf_filename"] = form_att.get("filename")
 
-    # 3) OCR semua bukti bayar (gambar)
+    # 3) OCR all payment receipt images
     receipt_atts = _get_receipt_image_attachments(attachments)
     receipts_result: List[Dict[str, Any]] = []
 
@@ -789,7 +845,7 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
             receipts_result.append(
                 {
                     "filename": filename,
-                    "error": "Gagal download attachment bukti bayar",
+                    "error": "Failed to download payment receipt attachment.",
                     "status": e.resp.status,
                     "reason": e._get_reason(),
                 }
@@ -804,7 +860,7 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
             receipts_result.append(
                 {
                     "filename": filename,
-                    "error": f"Gagal OCR: {e}",
+                    "error": f"OCR failed: {e}",
                 }
             )
             continue
@@ -829,22 +885,29 @@ def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
         "reconciliation": reconciliation,
     }
 
+
 @tool()
 def list_reimburse_emails_for_period(start_date: str, end_date: str, max_results: int = 50) -> Dict[str, Any]:
     """
-    Mengambil email reimbursement dalam rentang tanggal tertentu.
+    Fetch reimbursement emails within a specific date range.
 
     Args:
-        start_date: Tanggal awal (inclusive) format YYYY/MM/DD, contoh: '2025/04/14'.
-        end_date: Tanggal akhir eksklusif (dipakai di 'before'), contoh: '2025/04/18'.
-        max_results: Maks jumlah email yang diambil.
+        start_date: Start date (inclusive) in YYYY/MM/DD format, e.g. '2025/04/14'.
+        end_date: End date (exclusive) in YYYY/MM/DD format, used in 'before:'.
+        max_results: Max number of emails to fetch.
 
     Returns:
-        Dict yang berisi info periode dan list email (id, subject, from, date).
+        Dict containing period info and list of emails (id, subject, from, date).
     """
     service = _get_gmail_service()
+    finance_addr = "finance.request@pituku.id"
 
-    query = f'("reimburse" OR "reimbursement") after:{start_date} before:{end_date}'
+    query = (
+        f'("reimburse" OR "reimbursement") '
+        f'-subject:advance '
+        f'(to:{finance_addr} OR cc:{finance_addr}) '
+        f'after:{start_date} before:{end_date}'
+    )
 
     resp = (
         service.users()
@@ -871,17 +934,23 @@ def list_reimburse_emails_for_period(start_date: str, end_date: str, max_results
         )
 
         headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+        subject = headers.get("Subject", "") or ""
+
+        # Skip cash advance / advance fund requests
+        if "advance" in subject.lower():
+            continue
+
         emails.append(
             {
                 "id": m["id"],
-                "subject": headers.get("Subject", ""),
+                "subject": subject,
                 "from": headers.get("From", ""),
                 "date": headers.get("Date", ""),
                 "internal_ts": int(msg.get("internalDate", 0)),
             }
         )
 
-    # sort newest first berdasarkan internalDate
+    # sort newest-first by internalDate
     emails_sorted = sorted(emails, key=lambda x: x["internal_ts"], reverse=True)
     for e in emails_sorted:
         e.pop("internal_ts", None)
@@ -893,16 +962,15 @@ def list_reimburse_emails_for_period(start_date: str, end_date: str, max_results
         "emails": emails_sorted,
     }
 
+
 @tool()
 def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
     """
-    OCR SEMUA bukti bayar (gambar) di email ini dan ekstrak jumlah pembayaran
-    dari masing-masing attachment.
-
-    Cocok untuk kasus 1 form berisi beberapa item dan masing-masing ada bukti bayar.
+    OCR ALL payment receipt images in this email and extract payment amounts
+    from each attachment.
 
     Args:
-        message_id: ID email di Gmail.
+        message_id: Gmail message ID.
 
     Returns:
         {
@@ -917,7 +985,7 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
             ...
           ]
         }
-        atau field "error" kalau gagal.
+        or an error dict.
     """
     service = _get_gmail_service()
 
@@ -930,7 +998,7 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
         )
     except HttpError as e:
         return {
-            "error": "HttpError saat mengambil message untuk bukti bayar",
+            "error": "HttpError while fetching message for payment receipts.",
             "status": e.resp.status,
             "reason": e._get_reason(),
             "message_id": message_id,
@@ -942,7 +1010,7 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
     receipt_atts = _get_receipt_image_attachments(attachments)
     if not receipt_atts:
         return {
-            "error": "Tidak ditemukan attachment gambar (bukti bayar) pada email ini.",
+            "error": "No image attachments (payment receipts) found in this email.",
             "message_id": message_id,
             "attachments_ditemukan": attachments,
         }
@@ -959,7 +1027,7 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
             receipts_result.append(
                 {
                     "filename": filename,
-                    "error": "Gagal download attachment",
+                    "error": "Failed to download attachment.",
                     "status": e.resp.status,
                     "reason": e._get_reason(),
                 }
@@ -969,12 +1037,12 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
         try:
             ocr_text = _call_vision_ocr(img_bytes)
             amounts = _parse_amounts_from_text(ocr_text)
-            selected = amounts[-1] if amounts else None  # ambil terbesar
+            selected = amounts[-1] if amounts else None  # use the largest/last
         except Exception as e:
             receipts_result.append(
                 {
                     "filename": filename,
-                    "error": f"Gagal OCR: {e}",
+                    "error": f"OCR failed: {e}",
                 }
             )
             continue
@@ -993,17 +1061,19 @@ def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
         "receipts": receipts_result,
     }
 
+
 @tool()
 def parse_reimburse_form_from_email(message_id: str) -> Dict[str, Any]:
     """
-    Cari attachment PDF pertama di email ini, download, lalu parse form reimburse.
+    Find the first PDF attachment in this email, download it, and parse
+    the reimbursement form.
 
     Args:
-        message_id: ID email di Gmail.
+        message_id: Gmail message ID.
 
     Returns:
-        Dict berisi ringkasan reimburse (tanggal, item, total, info rekening)
-        atau error detail jika gagal panggil Gmail API.
+        Dict containing reimbursement summary (date, items, total, bank info),
+        or an error dict if Gmail API / parsing fails.
     """
     service = _get_gmail_service()
 
@@ -1016,7 +1086,7 @@ def parse_reimburse_form_from_email(message_id: str) -> Dict[str, Any]:
         )
     except HttpError as e:
         return {
-            "error": "HttpError saat mengambil message",
+            "error": "HttpError while fetching message.",
             "status": e.resp.status,
             "reason": e._get_reason(),
             "message_id": message_id,
@@ -1025,18 +1095,12 @@ def parse_reimburse_form_from_email(message_id: str) -> Dict[str, Any]:
     attachments = []
     _collect_attachments(msg.get("payload"), attachments)
 
-    # pilih attachment PDF pertama
-    pdf_att = None
-    for att in attachments:
-        mime = (att.get("mimeType") or "").lower()
-        filename = (att.get("filename") or "").lower()
-        if "pdf" in mime or filename.endswith(".pdf"):
-            pdf_att = att
-            break
+    # pick the first PDF attachment
+    pdf_att = _select_form_pdf_attachment(attachments)
 
     if not pdf_att:
         return {
-            "error": "Tidak ditemukan attachment PDF pada email ini.",
+            "error": "No PDF attachment found in this email.",
             "message_id": message_id,
             "attachments_ditemukan": attachments,
         }
@@ -1047,7 +1111,7 @@ def parse_reimburse_form_from_email(message_id: str) -> Dict[str, Any]:
         )
     except HttpError as e:
         return {
-            "error": "HttpError saat mengambil attachment",
+            "error": "HttpError while downloading attachment.",
             "status": e.resp.status,
             "reason": e._get_reason(),
             "message_id": message_id,
@@ -1055,12 +1119,12 @@ def parse_reimburse_form_from_email(message_id: str) -> Dict[str, Any]:
             "filename": pdf_att.get("filename"),
         }
 
-    # kalau sampai sini aman, baru parse PDF-nya
+    # If we get here, download was fine; now parse the PDF.
     try:
         parsed = _parse_reimburse_form_pdf(pdf_bytes)
     except Exception as e:
         return {
-            "error": f"Gagal parse PDF: {e}",
+            "error": f"Failed to parse PDF: {e}",
             "message_id": message_id,
             "filename": pdf_att.get("filename"),
         }
@@ -1070,16 +1134,18 @@ def parse_reimburse_form_from_email(message_id: str) -> Dict[str, Any]:
 
     return parsed
 
+
 @tool()
 def get_email_detail(message_id: str) -> Dict[str, Any]:
     """
-    Mengambil detail 1 email, termasuk body dan daftar attachment.
+    Fetch detailed information of a single email, including body and
+    attachments list.
 
     Args:
-        message_id: ID message Gmail (didapat dari list_recent_emails).
+        message_id: Gmail message ID (from list_recent_emails).
 
     Returns:
-        Dict berisi header, body, dan attachments.
+        Dict containing header fields, body, and attachments.
     """
     service = _get_gmail_service()
 
@@ -1106,17 +1172,18 @@ def get_email_detail(message_id: str) -> Dict[str, Any]:
         "attachments": attachments,
     }
 
+
 @tool()
 def list_recent_emails(query: str = "", max_results: int = 10) -> List[Dict[str, Any]]:
     """
-    Mengambil daftar email terbaru dari Gmail.
+    Fetch a list of recent emails from Gmail.
 
     Args:
-        query: Query Gmail (mis. 'subject:reimbursement OR subject:claim').
-        max_results: Jumlah maksimum email yang diambil.
+        query: Gmail query string (e.g. 'subject:reimbursement OR subject:claim').
+        max_results: Max number of emails to return.
 
     Returns:
-        List dict berisi id, subject, from, date, snippet.
+        List of dicts containing id, subject, from, date, snippet.
     """
     service = _get_gmail_service()
 
