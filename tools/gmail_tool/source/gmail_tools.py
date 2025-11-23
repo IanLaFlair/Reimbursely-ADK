@@ -15,6 +15,9 @@ import re
 from pathlib import Path
 import requests
 
+import io
+import base64
+# import pandas as pd
 
 
 
@@ -187,8 +190,115 @@ def _get_receipt_image_attachments(attachments: List[Dict[str, Any]]) -> List[Di
             receipt_atts.append(att)
     return receipt_atts
 
+def _reconcile_form_and_receipts(form_data: Dict[str, Any], receipts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Cocokkan items di form dengan bukti bayar (receipts).
 
-def reconcile_form_and_receipts(form, receipts):
+    form_data:
+      {
+        "tanggal_pengajuan": "...",
+        "items": [
+          {"description": "...", "harga": 300000, "jumlah": 1, "subtotal": 300000},
+          ...
+        ],
+        "total": 300000,
+        "rekening": {...}
+      }
+
+    receipts:
+      [
+        {
+          "filename": "...",
+          "candidate_amounts": [...],
+          "selected_amount": 300000,
+          ...
+        },
+        ...
+      ]
+    """
+    items: List[Dict[str, Any]] = form_data.get("items", [])
+    # hanya receipts yang punya selected_amount valid
+    usable_receipts = [
+        {"idx": i, "amount": r.get("selected_amount"), "filename": r.get("filename")}
+        for i, r in enumerate(receipts)
+        if isinstance(r.get("selected_amount"), int)
+    ]
+
+    used_flags = {r["idx"]: False for r in usable_receipts}
+    per_item_results: List[Dict[str, Any]] = []
+
+    for item in items:
+        target = item.get("subtotal")
+        matched_idx = None
+        matched_filename = None
+
+        if isinstance(target, int):
+            for r in usable_receipts:
+                if used_flags[r["idx"]]:
+                    continue
+                if r["amount"] == target:
+                    matched_idx = r["idx"]
+                    matched_filename = r["filename"]
+                    break
+
+        if matched_idx is not None:
+            used_flags[matched_idx] = True
+            per_item_results.append(
+                {
+                    "description": item.get("description") or item.get("deskripsi"),
+                    "subtotal": target,
+                    "status": "MATCH",
+                    "receipt_filename": matched_filename,
+                }
+            )
+        else:
+            per_item_results.append(
+                {
+                    "description": item.get("description") or item.get("deskripsi"),
+                    "subtotal": target,
+                    "status": "MISSING_RECEIPT",
+                    "receipt_filename": None,
+                }
+            )
+
+    # semua receipts yang tidak terpakai
+    unmatched_receipts = [
+        receipts[idx]
+        for idx, used in used_flags.items()
+        if not used
+    ]
+
+    form_total = form_data.get("total")
+    sum_receipts = sum(
+        r.get("selected_amount") or 0 for r in receipts if isinstance(r.get("selected_amount"), int)
+    )
+
+    overall_status = "OK"
+    notes: List[str] = []
+
+    if form_total is not None and isinstance(form_total, int):
+        if form_total != sum_receipts:
+            overall_status = "MISMATCH"
+            notes.append(
+                f"Total form ({form_total}) tidak sama dengan total bukti bayar ({sum_receipts})."
+            )
+
+    if any(i["status"] != "MATCH" for i in per_item_results):
+        overall_status = "MISMATCH"
+        notes.append("Ada item yang tidak punya bukti bayar yang cocok.")
+
+    if unmatched_receipts:
+        notes.append("Ada bukti bayar yang tidak terpakai / tidak cocok dengan item mana pun.")
+
+    return {
+        "overall_status": overall_status,
+        "items": per_item_results,
+        "unmatched_receipts": unmatched_receipts,
+        "form_total": form_total,
+        "sum_receipt_amounts": sum_receipts,
+        "notes": notes,
+    }
+
     items = form["items"]
     receipts_list = receipts["receipts"]
 
@@ -342,6 +452,141 @@ def _collect_attachments(payload, out_list):
         _collect_attachments(part, out_list)
 
 @tool()
+def export_reimburse_summary_this_week() -> Dict[str, Any]:
+    
+    """
+    Generate laporan reimbursement minggu ini dalam bentuk file Excel (sheet Summary saja).
+
+    - Ambil semua email reimburse minggu ini dari Gmail.
+    - Analisa tiap email dengan analyze_reimburse_email.
+    - Susun 1 sheet Summary berisi:
+        Email ID, Subject, Tanggal Pengajuan, Total Form, Total Bukti Bayar, Status, Catatan.
+    - Kembalikan file Excel sebagai base64 string.
+    """
+    import pandas as pd
+    service = _get_gmail_service()
+
+    # 1) Range minggu ini (helper yang sudah ada di kode kamu)
+    start_date, end_date_exclusive = _get_current_week_range_until_today()
+
+    # Query sama seperti list_reimburse_emails_this_week (silakan samakan kalau beda)
+    query = f"after:{start_date} before:{end_date_exclusive} reimburse"
+
+    try:
+        resp = (
+            service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=50)
+            .execute()
+        )
+    except HttpError as e:
+        return {
+            "error": "HttpError saat mencari email reimburse minggu ini",
+            "status": e.resp.status,
+            "reason": e._get_reason(),
+            "start_date": start_date,
+            "end_date_exclusive": end_date_exclusive,
+        }
+
+    messages = resp.get("messages", []) or []
+
+    summary_rows: List[Dict[str, Any]] = []
+
+    for m in messages:
+        msg_id = m.get("id")
+        if not msg_id:
+            continue
+
+        try:
+            analysis = analyze_reimburse_email(message_id=msg_id)
+        except Exception as e:
+            summary_rows.append(
+                {
+                    "Email ID": msg_id,
+                    "Subject": "",
+                    "Tanggal Pengajuan": "",
+                    "Total Form": None,
+                    "Total Bukti Bayar": None,
+                    "Status": "ERROR",
+                    "Catatan": f"Gagal analisa: {e}",
+                }
+            )
+            continue
+
+        form = analysis.get("form_data", {}) or {}
+        recon = analysis.get("reconciliation", {}) or {}
+
+        tanggal_pengajuan = form.get("tanggal_pengajuan", "")
+        total_form = form.get("total")
+        total_receipts = recon.get("sum_receipt_amounts")
+
+        status = recon.get("overall_status", "UNKNOWN")
+        notes_list = recon.get("notes", []) or []
+        catatan = "; ".join(notes_list)
+
+        summary_rows.append(
+            {
+                "Email ID": msg_id,
+                "Subject": analysis.get("subject", ""),
+                "Tanggal Pengajuan": tanggal_pengajuan,
+                "Total Form": total_form,
+                "Total Bukti Bayar": total_receipts,
+                "Status": status,
+                "Catatan": catatan,
+            }
+        )
+
+    # 2) Kalau tidak ada email, tetap return info
+    if not summary_rows:
+        return {
+            "filename": "reimbursely_summary_minggu_ini.xlsx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "file_base64": None,
+            "row_count": 0,
+            "start_date": start_date,
+            "end_date_exclusive": end_date_exclusive,
+            "info": "Tidak ada email reimbursement minggu ini.",
+        }
+
+    # 3) Buat DataFrame dan Excel di memory
+    df = pd.DataFrame(summary_rows)
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name="Summary", index=False)
+
+        # Rapihin dikit: header bold, auto filter, auto width
+        workbook = writer.book
+        worksheet = writer.sheets["Summary"]
+
+        header_format = workbook.add_format({"bold": True})
+        worksheet.set_row(0, None, header_format)
+
+        # Autofilter seluruh range
+        worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
+
+        # Auto column width
+        for col_idx, col_name in enumerate(df.columns):
+            # panjang maksimum antara nama kolom dan isi kolom
+            max_len = max(
+                df[col_name].astype(str).map(len).max(),
+                len(col_name),
+            )
+            worksheet.set_column(col_idx, col_idx, max_len + 2)
+
+    excel_bytes = buffer.getvalue()
+    file_b64 = base64.b64encode(excel_bytes).decode("utf-8")
+
+    return {
+        "filename": "reimbursely_summary_minggu_ini.xlsx",
+        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "file_base64": file_b64,
+        "row_count": len(summary_rows),
+        "start_date": start_date,
+        "end_date_exclusive": end_date_exclusive,
+    }
+
+@tool()
 def extract_all_payment_amounts_from_email(message_id: str) -> Dict[str, Any]:
     """
     OCR SEMUA bukti bayar (gambar) di email ini dan ekstrak jumlah bayar dari masing-masing.
@@ -428,6 +673,161 @@ def list_reimburse_emails_this_week(max_results: int = 50) -> Dict[str, Any]:
     """
     start_date, tomorrow = _get_current_week_range_until_today()
     return list_reimburse_emails_for_period(start_date, tomorrow, max_results)
+
+@tool()
+def analyze_reimburse_email(message_id: str) -> Dict[str, Any]:
+    """
+    Analisa lengkap 1 email reimbursement:
+    - Parse form reimburse (PDF) dari attachment.
+    - OCR semua bukti bayar (gambar) di email.
+    - Cocokkan item di form dengan bukti bayar.
+    - Kembalikan status OK / MISMATCH dan detailnya.
+
+    Args:
+        message_id: ID email di Gmail.
+
+    Returns:
+        Dict berisi:
+          - form_data
+          - receipts
+          - reconciliation (overall_status, per item, unmatched, total)
+        atau error jika ada yang gagal.
+    """
+    service = _get_gmail_service()
+
+    # 1) Ambil email
+    try:
+        msg = (
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute()
+        )
+
+        # Ambil subject dari header
+        payload = msg.get("payload", {})
+        headers = payload.get("headers", [])
+
+        subject = ""
+        for h in headers:
+            name = h.get("name", "").lower()
+            if name == "subject":
+                subject = h.get("value", "")
+                break
+
+    except HttpError as e:
+        return {
+            "error": "HttpError saat mengambil message",
+            "status": e.resp.status,
+            "reason": e._get_reason(),
+            "message_id": message_id,
+        }
+
+    attachments: List[Dict[str, Any]] = []
+    _collect_attachments(msg.get("payload"), attachments)
+
+    if not attachments:
+        return {
+            "error": "Tidak ada attachment pada email ini.",
+            "message_id": message_id,
+        }
+
+    # 2) Cari PDF form reimburse (ambil PDF pertama saja untuk versi 1)
+    form_att = None
+    for att in attachments:
+        mime = (att.get("mimeType") or "").lower()
+        filename = (att.get("filename") or "").lower()
+        if mime == "application/pdf" or filename.endswith(".pdf"):
+            form_att = att
+            break
+
+    if not form_att:
+        return {
+            "error": "Tidak ditemukan attachment PDF form reimburse pada email ini.",
+            "message_id": message_id,
+            "attachments_ditemukan": attachments,
+        }
+
+    # Download & parse PDF form
+    try:
+        pdf_bytes = _download_attachment_bytes(
+            service, message_id, form_att["attachment_id"]
+        )
+    except HttpError as e:
+        return {
+            "error": "HttpError saat download PDF form",
+            "status": e.resp.status,
+            "reason": e._get_reason(),
+            "message_id": message_id,
+            "attachment_id": form_att.get("attachment_id"),
+            "filename": form_att.get("filename"),
+        }
+
+    try:
+        form_data = _parse_reimburse_form_pdf(pdf_bytes)
+    except Exception as e:
+        return {
+            "error": f"Gagal parse PDF form: {e}",
+            "message_id": message_id,
+            "filename": form_att.get("filename"),
+        }
+
+    form_data["source_email_id"] = message_id
+    form_data["source_pdf_filename"] = form_att.get("filename")
+
+    # 3) OCR semua bukti bayar (gambar)
+    receipt_atts = _get_receipt_image_attachments(attachments)
+    receipts_result: List[Dict[str, Any]] = []
+
+    for att in receipt_atts:
+        filename = att.get("filename")
+        try:
+            img_bytes = _download_attachment_bytes(
+                service, message_id, att["attachment_id"]
+            )
+        except HttpError as e:
+            receipts_result.append(
+                {
+                    "filename": filename,
+                    "error": "Gagal download attachment bukti bayar",
+                    "status": e.resp.status,
+                    "reason": e._get_reason(),
+                }
+            )
+            continue
+
+        try:
+            ocr_text = _call_vision_ocr(img_bytes)
+            amounts = _parse_amounts_from_text(ocr_text)
+            selected = amounts[-1] if amounts else None
+        except Exception as e:
+            receipts_result.append(
+                {
+                    "filename": filename,
+                    "error": f"Gagal OCR: {e}",
+                }
+            )
+            continue
+
+        receipts_result.append(
+            {
+                "filename": filename,
+                "candidate_amounts": amounts,
+                "selected_amount": selected,
+                "ocr_text_preview": (ocr_text[:300] + "…") if ocr_text else "",
+            }
+        )
+
+    # 4) Reconcile form vs receipts
+    reconciliation = _reconcile_form_and_receipts(form_data, receipts_result)
+
+    return {
+        "message_id": message_id,
+        "subject": subject,
+        "form_data": form_data,
+        "receipts": receipts_result,
+        "reconciliation": reconciliation,
+    }
 
 @tool()
 def list_reimburse_emails_for_period(start_date: str, end_date: str, max_results: int = 50) -> Dict[str, Any]:
